@@ -1,0 +1,30 @@
+# wrangler.toml — Emergency recovery worker (SEPARATE from the main app).
+#
+# Deploy from this folder:
+#   cd recovery-worker
+#   npx wrangler deploy
+#
+# The database_id below is the SAME attendance-db the main app uses, so this
+# worker reads/writes the same users table.
+#
+# SECURITY MODEL: "Internal-Only / Dashboard Preview".
+# The worker code rejects ordinary public HTTP traffic with 403 and only serves
+# the UI + reset action from Cloudflare's internal preview / Quick Edit context
+# (detected via User-Agent "Cloudflare-Workers-Preview" and preview-only hosts).
+#
+# ⚠️ This is security-through-obscurity: the User-Agent check is SPOOFABLE, so it
+# is NOT a real auth boundary. It keeps casual/public traffic out, but for a
+# production-grade lockdown, protect the worker with Cloudflare Access instead.
+# Intended for a testing environment where you use the Quick Edit preview pane
+# after logging into your Cloudflare account.
+
+name = "recovery-worker"
+main = "recovery-worker.js"
+compatibility_date = "2024-11-01"
+
+# Same D1 database as the main attendance app.
+[[d1_databases]]
+binding = "DB"
+database_name = "attendance-db"
+database_id = "66e1dc11-1d9f-4c39-ba61-b6624d767ad5"
+
