@@ -12,6 +12,7 @@ import Members from './Members'
 import TransferRequests from './TransferRequests'
 import ChangePassword from './ChangePassword'
 import ClockFooter from './ClockFooter'
+import Chat from './Chat'
 
 /**
  * Role-aware dashboard shell. Builds the nav from the user's role and renders
@@ -57,6 +58,7 @@ export default function Dashboard({ user, onLogout }) {
     canCreateUsers && { key: 'users', label: 'ساخت کاربر' },
     canManageUsers && { key: 'manage', label: 'مدیریت کاربران' },
     { key: 'password', label: 'تغییر رمز' },
+    { key: 'chat', label: '💬 چت' },
   ].filter(Boolean)
 
   return (
@@ -104,6 +106,7 @@ export default function Dashboard({ user, onLogout }) {
           )}
           {tab === 'manage' && canManageUsers && <UserManagement me={user} />}
           {tab === 'password' && <ChangePassword />}
+          {tab === 'chat' && <Chat me={user} />}
         </div>
       </div>
 

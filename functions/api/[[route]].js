@@ -1913,6 +1913,226 @@ app.get('/attendance/report', async (c) => {
   return c.json({ from: from ?? null, to: to ?? null, summary, members: rows, trend })
 })
 
+
+// ============================================================================
+// Chat / Messenger — direct Supabase integration.
+// All routes are protected by the JWT auth middleware above.
+// Requires env vars: SUPABASE_URL, SUPABASE_KEY
+// ============================================================================
+
+/** Supabase REST helper — same pattern as the standalone chat-messenger worker. */
+async function sbQuery(env, table, options = {}) {
+  const { method = 'GET', body = null, params = {}, prefer = null } = options
+  const url = new URL(`${env.SUPABASE_URL}/rest/v1/${table}`)
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null) url.searchParams.set(k, v)
+  })
+  const headers = {
+    apikey: env.SUPABASE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_KEY}`,
+    'Content-Type': 'application/json',
+  }
+  if (prefer) headers.Prefer = prefer
+  const fetchOpts = { method, headers }
+  if (body && method !== 'GET') fetchOpts.body = JSON.stringify(body)
+  const resp = await fetch(url.toString(), fetchOpts)
+  const text = await resp.text()
+  let data
+  try { data = text ? JSON.parse(text) : null } catch { data = text }
+  if (!resp.ok) {
+    const msg = data?.message || data?.error || data?.hint || `Supabase ${resp.status}`
+    throw new Error(`Supabase: ${msg}`)
+  }
+  return data
+}
+
+/** Generate a signed URL for Supabase Storage. */
+async function sbSignedUrl(env, bucket, path, expiresIn = 3600) {
+  const resp = await fetch(`${env.SUPABASE_URL}/storage/v1/object/sign/${bucket}/${path}`, {
+    method: 'POST',
+    headers: { apikey: env.SUPABASE_KEY, Authorization: `Bearer ${env.SUPABASE_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expiresIn }),
+  })
+  const data = await resp.json()
+  if (!resp.ok) throw new Error(`Signed URL error: ${data.message || resp.status}`)
+  return typeof data === 'string' ? data : data.url || data.signedUrl
+}
+
+/** Get the authenticated user's username from D1. */
+async function getUsername(env, userId) {
+  const row = await env.DB.prepare('SELECT username FROM users WHERE id = ?').bind(userId).first()
+  return row?.username || null
+}
+
+// GET /api/chat/users — list all chat users
+app.get('/chat/users', async (c) => {
+  try {
+    const users = await sbQuery(c.env, 'chat_users', { params: { order: 'display_name.asc' } })
+    return c.json({ success: true, users: users || [] })
+  } catch (e) { return c.json({ success: false, error: e.message }, 500) }
+})
+
+// POST /api/chat/sync-user — sync D1 user to Supabase chat_users
+app.post('/chat/sync-user', async (c) => {
+  const user = c.get('user')
+  const row = await c.env.DB.prepare('SELECT username, display_name FROM users WHERE id = ?').bind(user.id).first()
+  const username = row?.username || user.username
+  const display_name = row?.display_name || username
+  try {
+    await sbQuery(c.env, 'chat_users', {
+      method: 'POST',
+      body: { username, display_name },
+      params: { on_conflict: 'username' },
+      prefer: 'resolution=merge-duplicates',
+    })
+    return c.json({ success: true, message: `User "${username}" synced` })
+  } catch (e) { return c.json({ success: false, error: e.message }, 500) }
+})
+
+// GET /api/chat/unread-count?username=...
+app.get('/chat/unread-count', async (c) => {
+  const user = c.get('user')
+  const username = await getUsername(c.env, user.id)
+  if (!username) return c.json({ success: true, count: 0 })
+  try {
+    const chats = await sbQuery(c.env, 'chats', {
+      params: { or: `(user1_username.eq.${username},user2_username.eq.${username})`, select: 'id' },
+    })
+    if (!chats || chats.length === 0) return c.json({ success: true, count: 0 })
+    const ids = chats.map(ch => ch.id).join(',')
+    const msgs = await sbQuery(c.env, 'messages', {
+      params: { and: `(is_read.eq.false,sender_username.neq.${username})`, chat_id: `in.(${ids})`, select: 'id' },
+    })
+    return c.json({ success: true, count: Array.isArray(msgs) ? msgs.length : 0 })
+  } catch (e) { return c.json({ success: false, error: e.message }, 500) }
+})
+
+// POST /api/chat/get-or-create-chat
+app.post('/chat/get-or-create-chat', async (c) => {
+  const user = c.get('user')
+  const me = await getUsername(c.env, user.id)
+  let body
+  try { body = await c.req.json() } catch { return c.json({ error: 'Invalid JSON' }, 400) }
+  const target = body.targetUser
+  if (!me || !target) return c.json({ error: 'targetUser required' }, 400)
+  if (me === target) return c.json({ error: 'Cannot chat with yourself' }, 400)
+  const sorted = [me, target].sort()
+  try {
+    const existing = await sbQuery(c.env, 'chats', {
+      params: { and: `(user1_username.eq.${sorted[0]},user2_username.eq.${sorted[1]})`, select: 'id' },
+    })
+    if (existing && existing.length > 0) return c.json({ success: true, chatId: existing[0].id, created: false })
+    const created = await sbQuery(c.env, 'chats', {
+      method: 'POST', body: { user1_username: sorted[0], user2_username: sorted[1] },
+      params: { select: 'id' }, prefer: 'return=representation',
+    })
+    const chatId = Array.isArray(created) ? created[0]?.id : created?.id
+    return c.json({ success: true, chatId, created: true })
+  } catch (e) { return c.json({ success: false, error: e.message }, 500) }
+})
+
+// GET /api/chat/get-messages?chatId=...&page=1&limit=50
+app.get('/chat/get-messages', async (c) => {
+  const url = new URL(c.req.url)
+  const chatId = url.searchParams.get('chatId')
+  const page = parseInt(url.searchParams.get('page') || '1', 10)
+  const limit = parseInt(url.searchParams.get('limit') || '50', 10)
+  if (!chatId) return c.json({ error: 'chatId required' }, 400)
+  const offset = (page - 1) * limit
+  try {
+    const messages = await sbQuery(c.env, 'messages', {
+      params: { chat_id: `eq.${chatId}`, order: 'created_at.desc', limit, offset },
+    })
+    if (!messages || messages.length === 0) return c.json({ success: true, messages: [], hasMore: false })
+    // Generate signed URLs for attachments
+    const enriched = await Promise.all(messages.map(async (msg) => {
+      if (msg.attachment_path) {
+        try {
+          const signedUrl = await sbSignedUrl(c.env, 'chat_attachments', msg.attachment_path)
+          return { ...msg, attachment_url: signedUrl }
+        } catch { return { ...msg, attachment_url: null } }
+      }
+      return msg
+    }))
+    enriched.reverse()
+    return c.json({ success: true, messages: enriched, hasMore: messages.length === limit, page })
+  } catch (e) { return c.json({ success: false, error: e.message }, 500) }
+})
+
+// POST /api/chat/send-message
+app.post('/chat/send-message', async (c) => {
+  const user = c.get('user')
+  const me = await getUsername(c.env, user.id)
+  let body
+  try { body = await c.req.json() } catch { return c.json({ error: 'Invalid JSON' }, 400) }
+  const { chatId, content, attachmentPath } = body
+  if (!chatId || !me) return c.json({ error: 'chatId required' }, 400)
+  if (!content && !attachmentPath) return c.json({ error: 'content or attachmentPath required' }, 400)
+  try {
+    const result = await sbQuery(c.env, 'messages', {
+      method: 'POST',
+      body: { chat_id: chatId, sender_username: me, content: content || null, attachment_path: attachmentPath || null, is_read: false },
+      params: { select: '*' }, prefer: 'return=representation',
+    })
+    return c.json({ success: true, data: Array.isArray(result) ? result[0] : result })
+  } catch (e) { return c.json({ success: false, error: e.message }, 500) }
+})
+
+// POST /api/chat/upload-file (multipart form-data)
+app.post('/chat/upload-file', async (c) => {
+  const user = c.get('user')
+  const me = await getUsername(c.env, user.id)
+  try {
+    const formData = await c.req.formData()
+    const file = formData.get('file')
+    const chatId = formData.get('chatId')
+    const content = formData.get('content') || ''
+    if (!file || !chatId || !me) return c.json({ error: 'file, chatId required' }, 400)
+    const ts = Date.now()
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_')
+    const filePath = `${chatId}/${ts}_${safeName}`
+    // Upload to Supabase Storage
+    const fileBuf = await file.arrayBuffer()
+    const upResp = await fetch(`${c.env.SUPABASE_URL}/storage/v1/object/chat_attachments/${filePath}`, {
+      method: 'POST',
+      headers: { apikey: c.env.SUPABASE_KEY, Authorization: `Bearer ${c.env.SUPABASE_KEY}`, 'Content-Type': file.type || 'application/octet-stream', 'x-upsert': 'true' },
+      body: fileBuf,
+    })
+    if (!upResp.ok) {
+      const err = await upResp.text()
+      return c.json({ error: `Upload failed: ${err}` }, 500)
+    }
+    // Create message
+    const result = await sbQuery(c.env, 'messages', {
+      method: 'POST',
+      body: { chat_id: chatId, sender_username: me, content: content || null, attachment_path: filePath, is_read: false },
+      params: { select: '*' }, prefer: 'return=representation',
+    })
+    const msg = Array.isArray(result) ? result[0] : result
+    // Signed URL
+    let attachmentUrl = null
+    try { attachmentUrl = await sbSignedUrl(c.env, 'chat_attachments', filePath) } catch {}
+    return c.json({ success: true, data: { ...msg, attachment_url: attachmentUrl } })
+  } catch (e) { return c.json({ success: false, error: e.message }, 500) }
+})
+
+// POST /api/chat/mark-read
+app.post('/chat/mark-read', async (c) => {
+  const user = c.get('user')
+  const me = await getUsername(c.env, user.id)
+  let body
+  try { body = await c.req.json() } catch { return c.json({ error: 'Invalid JSON' }, 400) }
+  const { chatId } = body
+  if (!chatId || !me) return c.json({ error: 'chatId required' }, 400)
+  try {
+    await sbQuery(c.env, 'messages', {
+      method: 'PATCH', body: { is_read: true },
+      params: { and: `(chat_id.eq.${chatId},is_read.eq.false,sender_username.neq.${me})` },
+    })
+    return c.json({ success: true, message: 'Marked as read' })
+  } catch (e) { return c.json({ success: false, error: e.message }, 500) }
+})
+
 // ----------------------------------------------------------------------------
 // Fallbacks
 // ----------------------------------------------------------------------------
